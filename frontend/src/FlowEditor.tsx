@@ -1,12 +1,10 @@
-import React, { useCallback } from 'react';
+import React from 'react';
 import {
   ReactFlow,
   MiniMap,
   Controls,
   Background,
-  useNodesState,
-  useEdgesState,
-  addEdge,
+  BackgroundVariant,
   type Connection,
   type Edge as FlowEdge,
   type Node as FlowNode,
@@ -21,6 +19,8 @@ interface FlowEditorProps {
   onEdgesChange: any;
   onConnect: (connection: Connection) => void;
   nodeStatuses: Map<string, NodeStatus>;
+  onNodeClick?: (id: string) => void;
+  onEdgeClick?: (id: string) => void;
 }
 
 const FlowEditor: React.FC<FlowEditorProps> = ({
@@ -30,7 +30,10 @@ const FlowEditor: React.FC<FlowEditorProps> = ({
   onEdgesChange,
   onConnect,
   nodeStatuses,
+  onNodeClick,
+  onEdgeClick,
 }) => {
+  const dotsVariant: BackgroundVariant = BackgroundVariant.Dots;
     
   // Custom styling based on status
   const getStyledNodes = () => {
@@ -56,11 +59,13 @@ const FlowEditor: React.FC<FlowEditorProps> = ({
         onNodesChange={onNodesChange}
         onEdgesChange={onEdgesChange}
         onConnect={onConnect}
+        onNodeClick={(_, node) => onNodeClick && onNodeClick(node.id)}
+        onEdgeClick={(_, edge) => onEdgeClick && onEdgeClick(edge.id)}
         fitView
       >
         <Controls />
         <MiniMap />
-        <Background variant="dots" gap={12} size={1} />
+        <Background variant={dotsVariant} gap={12} size={1} />
       </ReactFlow>
     </div>
   );

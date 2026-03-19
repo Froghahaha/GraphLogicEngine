@@ -1,0 +1,49 @@
+{
+  "version": "0.2.0",
+  "configurations": [
+    {
+      "name": "Debug Frontend (Edge)",
+      "type": "msedge",
+      "request": "launch",
+      "url": "http://localhost:5173",
+      "webRoot": "${workspaceFolder}/frontend",
+      "runtimeExecutable": "C:/Program Files (x86)/Microsoft/Edge/Application/msedge.exe",
+      "runtimeArgs": [
+        "--remote-debugging-port=9222"
+      ],
+      "timeout": 30000
+    },
+    {
+      "name": "Debug Backend (Spring Boot)",
+      "type": "java",
+      "request": "attach",
+      "hostName": "localhost",
+      "port": 5005
+    },
+    {
+      "name": "🚀 Launch Full Stack (一键调试)",
+      "preLaunchTask": "Start All Services",
+      "type": "msedge",
+      "request": "launch",
+      "url": "http://localhost:5173",
+      "webRoot": "${workspaceFolder}/frontend",
+      "runtimeExecutable": "C:/Program Files (x86)/Microsoft/Edge/Application/msedge.exe",
+      "runtimeArgs": [
+        "--remote-debugging-port=9222"
+      ],
+      "serverReadyAction": {
+        "pattern": "Local:\\s+http://localhost:(\\d+)/",
+        "uriFormat": "http://localhost:%s",
+        "action": "debugWithEdge"
+      },
+      "timeout": 60000
+    }
+  ],
+  "compounds": [
+    {
+      "name": "🔧 Debug Full Stack (前后端同时)",
+      "configurations": ["Debug Backend (Spring Boot)", "Debug Frontend (Edge)"],
+      "preLaunchTask": "Start All Services"
+    }
+  ]
+}

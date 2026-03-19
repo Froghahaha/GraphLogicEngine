@@ -1,0 +1,69 @@
+{
+  "version": "2.0.0",
+  "tasks": [
+    {
+      "label": "Frontend: Dev Server (Vite)",
+      "type": "shell",
+      "command": "npm",
+      "args": ["run", "dev"],
+      "options": {
+        "cwd": "${workspaceFolder}/frontend"
+      },
+      "isBackground": true,
+      "problemMatcher": {
+        "owner": "custom",
+        "pattern": [
+          {
+            "regexp": ".*"
+          }
+        ],
+        "background": {
+          "activeOnStart": true,
+          "beginsPattern": ".*",
+          "endsPattern": "Local:\\s+http://localhost:5173/"
+        }
+      },
+      "presentation": {
+        "reveal": "always",
+        "panel": "shared",
+        "group": "dev"
+      }
+    },
+    {
+      "label": "Backend: Spring Boot (Maven)",
+      "type": "shell",
+      "command": "mvn",
+      "args": ["spring-boot:run"],
+      "options": {
+        "cwd": "${workspaceFolder}/backend"
+      },
+      "isBackground": true,
+      "problemMatcher": {
+        "owner": "custom",
+        "pattern": [
+          {
+            "regexp": ".*"
+          }
+        ],
+        "background": {
+          "activeOnStart": true,
+          "beginsPattern": ".*",
+          "endsPattern": "Started.*in\\s+\\d+\\.\\d+\\s+seconds"
+        }
+      },
+      "presentation": {
+        "reveal": "always",
+        "panel": "shared",
+        "group": "dev"
+      }
+    },
+    {
+      "label": "Start All Services",
+      "dependsOn": [
+        "Frontend: Dev Server (Vite)",
+        "Backend: Spring Boot (Maven)"
+      ],
+      "dependsOrder": "parallel"
+    }
+  ]
+}

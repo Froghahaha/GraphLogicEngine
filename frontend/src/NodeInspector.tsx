@@ -1,25 +1,24 @@
 import React from 'react';
 import type { Node } from '@xyflow/react';
-import type { ExternalVarDef } from './types';
-import {
-    capabilityOptions,
-} from './nodeSchemas';
+import type { ExternalVarDef, CapabilityMetadata } from './types';
 import type { LogicalInternalVarDef, DecisionCondition } from './types';
 import VariablePicker from './VariablePicker';
 import type { Edge } from '@xyflow/react';
 
 type Props = {
     node: Node | null;
+    allNodes: Node[];
     allTaskNodes: Node[];
     edges: Edge[];
     selectedEdgeId: string | null;
     onSelectEdge: (id: string | null) => void;
     externalVars: ExternalVarDef[];
     internalVars: LogicalInternalVarDef[];
+    capabilities: CapabilityMetadata[];
     onChange: (id: string, patch: Record<string, any>) => void;
 };
 
-const NodeInspector: React.FC<Props> = ({ node, allTaskNodes, edges, selectedEdgeId, onSelectEdge, externalVars, internalVars, onChange }) => {
+const NodeInspector: React.FC<Props> = ({ node, allNodes, allTaskNodes, edges, selectedEdgeId, onSelectEdge, externalVars, internalVars, capabilities, onChange }) => {
     if (!node) {
         return (
             <div style={{ fontSize: '12px' }}>
@@ -40,7 +39,20 @@ const NodeInspector: React.FC<Props> = ({ node, allTaskNodes, edges, selectedEdg
     };
 
     const handleCapabilityIdChange = (e: React.ChangeEvent<HTMLSelectElement>) => {
-        handleFieldChange({ capabilityId: e.target.value });
+        const newCapId = e.target.value;
+        const cap = capabilities.find(c => c.id === newCapId);
+        
+        // When capability changes, auto-fill recommended timeout and reset params
+        const patch: Record<string, any> = { 
+            capabilityId: newCapId,
+            capabilityParams: {} 
+        };
+        
+        if (cap && cap.recommendedTimeoutMs) {
+            patch.timeoutMs = cap.recommendedTimeoutMs;
+        }
+        
+        handleFieldChange(patch);
     };
 
     const handleTimeoutChange = (e: React.ChangeEvent<HTMLInputElement>) => {
@@ -109,9 +121,9 @@ const NodeInspector: React.FC<Props> = ({ node, allTaskNodes, edges, selectedEdg
                             style={{ width: '100%', boxSizing: 'border-box', marginTop: '4px' }}
                         >
                             <option value="">Select capability</option>
-                            {capabilityOptions.map(opt => (
-                                <option key={opt.id} value={opt.id}>
-                                    {opt.label}
+                            {capabilities.map(cap => (
+                                <option key={cap.id} value={cap.id}>
+                                    {cap.id}
                                 </option>
                             ))}
                         </select>
@@ -125,6 +137,26 @@ const NodeInspector: React.FC<Props> = ({ node, allTaskNodes, edges, selectedEdg
                             style={{ width: '100%', boxSizing: 'border-box', marginTop: '4px' }}
                         />
                     </label>
+                    {data?.capabilityId && (
+                        <div style={{ marginTop: '8px', padding: '8px', background: '#f5f5f5', borderRadius: '4px' }}>
+                            <div style={{ fontWeight: 'bold', marginBottom: '4px' }}>Payload (JSON):</div>
+                            <textarea
+                                rows={4}
+                                value={typeof data?.capabilityParams === 'object' ? JSON.stringify(data.capabilityParams, null, 2) : (data?.capabilityParams ?? '{}')}
+                                onChange={(e) => {
+                                    try {
+                                        const parsed = JSON.parse(e.target.value);
+                                        handleFieldChange({ capabilityParams: parsed });
+                                    } catch (err) {
+                                        // Allow typing invalid JSON temporarily
+                                        handleFieldChange({ capabilityParams: e.target.value });
+                                    }
+                                }}
+                                style={{ width: '100%', boxSizing: 'border-box', marginTop: '2px', fontFamily: 'monospace', fontSize: '11px' }}
+                                placeholder='{"key": "value"}'
+                            />
+                        </div>
+                    )}
                 </div>
             )}
             {nodeKind === 'decision' && (
@@ -203,6 +235,8 @@ const NodeInspector: React.FC<Props> = ({ node, allTaskNodes, edges, selectedEdg
                 {outgoingEdges.map(e => {
                     const active = selectedEdgeId === e.id;
                     const role = (e.data as any)?.role;
+                    const targetNode = allNodes.find(n => n.id === e.target);
+                    const targetLabel = (targetNode?.data as any)?.label || e.target;
                     return (
                         <div
                             key={e.id}
@@ -215,11 +249,12 @@ const NodeInspector: React.FC<Props> = ({ node, allTaskNodes, edges, selectedEdg
                                 borderRadius: '6px',
                                 background: active ? '#e3f2fd' : '#fff',
                                 cursor: 'pointer',
+                                marginTop: '4px'
                             }}
                             onClick={() => onSelectEdge(e.id)}
                         >
                             <div style={{ overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>
-                                {role ? role : '(unset)'} → {e.target}
+                                {role ? role : '(unset)'} → {targetLabel}
                             </div>
                             <div style={{ fontSize: '11px', color: '#666' }}>Edit</div>
                         </div>

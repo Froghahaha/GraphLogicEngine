@@ -10,6 +10,7 @@ public class TimedMockCapability implements CapabilityInstance {
     private final long recommendedTimeoutMs;
     private final String doneCode;
     private final CapabilityResultCategory doneCategory;
+    private final CapabilityMetadata metadata;
 
     private CapabilityLifecycleState lifecycleState = CapabilityLifecycleState.IDLE;
     private CapabilityResult result;
@@ -20,13 +21,15 @@ public class TimedMockCapability implements CapabilityInstance {
                                long simulatedDurationMs,
                                long recommendedTimeoutMs,
                                String doneCode,
-                               CapabilityResultCategory doneCategory) {
+                               CapabilityResultCategory doneCategory,
+                               CapabilityMetadata metadata) {
         this.id = id;
         this.version = version;
         this.simulatedDurationMs = simulatedDurationMs;
         this.recommendedTimeoutMs = recommendedTimeoutMs;
         this.doneCode = doneCode;
         this.doneCategory = doneCategory;
+        this.metadata = metadata;
     }
 
     @Override
@@ -37,6 +40,11 @@ public class TimedMockCapability implements CapabilityInstance {
     @Override
     public String version() {
         return version;
+    }
+
+    @Override
+    public CapabilityMetadata getMetadata() {
+        return metadata;
     }
 
     @Override

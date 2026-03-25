@@ -194,15 +194,20 @@ Graph Logic Engine 中的“能力 (Capability)”指的是已经在底层实现
 > 注意：能力内部可以有更细致的子状态机，但对 Graph Logic Engine 的编排层仅暴露上述生命周期枚举。
 
 ### 4.5 结果与诊断 (Result & Diagnostics)
-能力执行结束后会给出结果与诊断信息：
-- `result_code`: 结果码，用于编排层 Decision 节点分支。例如 `"OK"`, `"NO_OBJECT"`, `"GRIP_FAIL"`, `"VISION_LOST"`。
-- `result_data`: 结构化结果数据（可选），例如扫码文本、测量值、统计信息等。
-- `diagnostics`: 诊断信息（可选），例如内部错误码、日志片段，主要用于工程调试与问题排查。
+能力执行结束后会给出结果与诊断信息。为了实现逻辑编排与业务细节的解耦，引擎采用**归一化语义流转**机制：
 
-可以为 `result_code` 定义一个枚举列表，每个条目包含：
-- `code`: 结果码字符串，如 `"OK"`；
-- `category`: 结果类别，如 `success` / `recoverable_error` / `fatal_error`；
-- `description`: 人类可读的解释。
+1.  **归一化结果类别 (Standardized Result Categories)**：
+    能力执行结束时，必须映射到以下四种标准类别之一：
+    - `SUCCESS`: 执行成功，逻辑继续。
+    - `RECOVERABLE_ERROR`: 遇到可恢复的问题，通常触发 `onRetry` 分支。
+    - `FATAL_ERROR`: 遇到致命错误，通常触发 `onAbort` 分支。
+    - `TIMEOUT`: 执行超过约定时间。
+
+2.  **业务详情 (Opaque Payload)**：
+    - `result_code`: 具体的业务结果码（如 `"GRIP_FAIL"`, `"VISION_LOST"`）。逻辑引擎将此视为透明 Payload，仅供 Decision 节点做精细化判断或 UI 展示。
+    - `result_data`: 结构化结果数据（可选）。
+
+这种设计保证了逻辑图的结构（如重试循环、错误处理分支）在更换底层业务能力实现时保持稳定。
 
 ### 4.6 约束与资源 (Constraints & Resources)
 能力契约中还可以声明自身的约束与资源使用情况：
@@ -272,9 +277,10 @@ Task 节点绑定某个能力 ID，并为该能力提供参数输入与结果输
   - 参数映射：将图中的变量、常量或上游 Task 输出映射到能力的参数；
   - 可选超时时间：若未指定，则采用能力契约中的 `recommended_timeout_ms`。
 - 输出（出边）：
-  - `onDone`: 当能力进入 Done 状态时激活；
-  - `onError`: 当能力进入 Error 状态时激活；
-  - `onTimeout`: 当能力进入 Timeout 状态时激活（可选）。
+  - `onSuccess`: 当能力返回 `SUCCESS` 类别时激活；
+  - `onRetry`: 当能力返回 `RECOVERABLE_ERROR` 类别时激活；
+  - `onAbort`: 当能力返回 `FATAL_ERROR` 类别时激活；
+  - `onTimeout`: 当能力返回 `TIMEOUT` 类别时激活。
 
 Task 节点还会将最近一次调用的 `result_code` 与 `result_data` 暴露为可读变量，供后续 Decision 或其它节点使用。
 
@@ -288,9 +294,9 @@ Task 节点还会将最近一次调用的 `result_code` 与 `result_data` 暴露
 - Tick N+1, N+2, ...：
   - 每个 Tick 检查能力的 `lifecycle_state`；
   - 若仍为 Running，则继续等待；
-  - 一旦状态变为 Done / Error / Timeout：
+  - 一旦状态变为 Done / Error / Timeout，并映射为归一化类别：
     - Task 标记自身为“完成”；
-    - 选择对应的出口（onDone/onError/onTimeout）激活下游节点。
+    - 选择对应的出口（onSuccess/onRetry/onAbort/onTimeout）激活下游节点。
 
 #### 5.2.3 Task 节点流程图 (Mermaid)
 
@@ -301,8 +307,9 @@ flowchart TD
     Trigger --> WaitState{Capability State?}
     WaitState -->|Running| WaitTick[Wait Next Tick]
     WaitTick --> WaitState
-    WaitState -->|Done| OutDone[onDone]
-    WaitState -->|Error| OutError[onError]
+    WaitState -->|Done| OutSuccess[onSuccess]
+    WaitState -->|Error \n Recoverable| OutRetry[onRetry]
+    WaitState -->|Error \n Fatal| OutAbort[onAbort]
     WaitState -->|Timeout| OutTimeout[onTimeout]
 ```
 
@@ -310,21 +317,32 @@ flowchart TD
 
 ```python
 def execute_task_node():
-    if just_activated():
+    if is_inactive():
         params = collect_inputs()
         capability_start(id="MoveToPose", params=params)
-        return  # 本 Tick 结束，等待下一个 Tick
+        set_node_state("WAITING")
+        self_schedule_next_tick() # 将自己加入下一 Tick 的 activeNodes
+        return
 
-    state = capability_get_state("MoveToPose")
-    if state == "Running":
-        return  # 继续等待
+    if is_waiting():
+        state = capability_get_state("MoveToPose")
+        if state == "Running":
+            self_schedule_next_tick()
+            return
 
-    if state == "Done":
-        route_to("onDone")
-    elif state == "Error":
-        route_to("onError")
-    elif state == "Timeout":
-        route_to("onTimeout")
+        # 映射归一化类别并分发
+        if state == "Done":
+            route_to("onSuccess")
+        elif state == "Timeout":
+            route_to("onTimeout")
+        elif state == "Error":
+            category = capability_get_result_category()
+            if category == "FATAL":
+                route_to("onAbort")
+            else:
+                route_to("onRetry")
+        
+        set_node_state("COMPLETED")
 ```
 
 ### 5.3 Decision 节点 (Decision Node)
@@ -429,7 +447,40 @@ def execute_join_node(task_ids, mode):
             route_to("onReady")
 ```
 
-## 6. 编译器映射 (Compiler Mapping)
+## 6. 可编译语义层 (Compilable Semantics Layer)
+
+本章节将图层语义收敛为“可被编译为字节码”的最小语义集合，以便后续在 STM32/C 与 Linux/C++ 上复现完全一致的行为。
+
+### 6.1 基本块 (Basic Block) 与 Tick
+- **Basic Block**：一段连续执行且不包含等待点的指令序列。
+- 一个 Frame 在单个 Tick 内可以连续执行多个 Basic Block，但必须满足以下停止条件之一：
+  - 遇到等待点（见 6.2）；
+  - 指令预算耗尽（见 6.4）；
+  - Frame 结束（END）。
+
+### 6.2 等待点 (Wait Points)
+等待点是 VM 指令级概念。遇到等待点时，当前 Frame 必须立即停止本 Tick 的执行并进入等待态，直到条件满足后在后续 Tick 继续运行。
+
+等待点仅允许来自以下语义：
+- **WAIT_ACTION**：等待异步动作完成。
+- **WAIT_JOIN**：等待并行汇合条件满足。
+- **WAIT_EXT**：等待外部变量满足条件。
+- **YIELD**：主动让出执行权（用于预算控制与循环安全）。
+
+### 6.3 归一化类别 (Normalized Category)
+Task 节点的分支流转必须基于归一化类别完成，以实现编排与业务细节解耦：
+- `SUCCESS` -> `onSuccess`
+- `RECOVERABLE_ERROR` -> `onRetry`
+- `FATAL_ERROR` -> `onAbort`
+- `TIMEOUT` -> `onTimeout`
+
+`result_code` / `result_data` 属于业务透明载荷，用于精细化判断或调试展示，不得作为引擎必须依赖的流转基础。
+
+### 6.4 确定性调度与预算 (Deterministic Scheduling & Budget)
+- **确定性调度**：并行 Frame 的执行顺序必须固定（例如按 FrameId 升序 Round-Robin）。
+- **预算约束**：VM 必须在运行时具备硬性预算控制（例如每 Tick 最大指令步数），预算耗尽时等价于执行一次 `YIELD`，并在下一 Tick 继续。
+
+## 7. 编译器映射 (Compiler Mapping)
 
 编译器将图形化逻辑转换为字节码时，遵循以下映射规则：
 

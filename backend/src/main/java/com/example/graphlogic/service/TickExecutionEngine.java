@@ -5,6 +5,11 @@ import com.example.graphlogic.model.Edge;
 import com.example.graphlogic.model.Flowchart;
 import com.example.graphlogic.model.Node;
 import com.example.graphlogic.model.NodeStatus;
+import com.example.graphlogic.capability.*;
+import com.example.graphlogic.compiler.GraphCompiler;
+import com.example.graphlogic.vm.BytecodeVm;
+import com.example.graphlogic.vm.HostBinding;
+import com.example.graphlogic.vm.Program;
 import org.springframework.messaging.simp.SimpMessagingTemplate;
 
 import java.util.*;
@@ -24,6 +29,8 @@ public class TickExecutionEngine {
 
     private final SimpMessagingTemplate messagingTemplate;
     private final long tickMillis;
+    private final CapabilityRegistry capabilityRegistry;
+    private final Map<String, CapabilityInstance> runningCapabilities = new ConcurrentHashMap<>();
 
     // 节点状态：INACTIVE, ACTIVE, WAITING, COMPLETED, ERROR
     private final Map<String, String> nodeRuntimeStatus = new ConcurrentHashMap<>();
@@ -36,9 +43,10 @@ public class TickExecutionEngine {
     private final Map<String, Object> internalVarsCurrent = new ConcurrentHashMap<>();
     private final Map<String, Object> internalVarsNext = new ConcurrentHashMap<>();
 
-    public TickExecutionEngine(SimpMessagingTemplate messagingTemplate, long tickMillis) {
+    public TickExecutionEngine(SimpMessagingTemplate messagingTemplate, long tickMillis, CapabilityRegistry capabilityRegistry) {
         this.messagingTemplate = messagingTemplate;
         this.tickMillis = tickMillis;
+        this.capabilityRegistry = capabilityRegistry;
         // 初始化默认外部变量
         externalVarsCurrent.put("WorkpieceExist", false);
         externalVarsCurrent.put("sensor_start", false);
@@ -71,79 +79,107 @@ public class TickExecutionEngine {
      * 4. 不搞过度抽象，直接用 Map 存状态
      */
     public void execute(Flowchart flowchart) {
-        // 初始化节点状态映射
-        Map<String, String> nodeStates = new HashMap<>();
-        for (Node node : flowchart.getNodes()) {
-            nodeStates.put(node.getId(), "INACTIVE");
-        }
+        Program program = new GraphCompiler().compile(flowchart);
 
-        // 当前 Tick 中激活的节点集合
-        Set<String> activeNodes = new HashSet<>();
+        final class EngineHost implements HostBinding {
+            private final Map<Integer, CapabilityInstance> handles = new HashMap<>();
+            private int nextHandle = 1;
+            private Map<String, Object> extSnapshot = Map.of();
 
-        // 下一 Tick 中应该激活的节点集合
-        Set<String> nextActiveNodes = new HashSet<>();
-
-        // 找到起始节点并激活
-        String startNodeId = findStartNodeId(flowchart);
-        if (startNodeId == null) {
-            return;
-        }
-        nextActiveNodes.add(startNodeId);
-
-        // 外部变量快照（双缓冲：current 用于读，next 用于写）
-        Map<String, Object> externalVarsCurrent = new HashMap<>(this.externalVarsCurrent);
-        Map<String, Object> externalVarsNext = new HashMap<>(this.externalVarsNext);
-
-        // 内部变量快照（双缓冲）
-        Map<String, Object> internalVarsCurrent = new HashMap<>(this.internalVarsCurrent);
-        Map<String, Object> internalVarsNext = new HashMap<>(this.internalVarsNext);
-
-        // 节点映射
-        Map<String, Node> nodeMap = mapNodes(flowchart);
-
-        long tick = 0;
-
-        // 主循环 - 真正的 Tick 驱动
-        while (!activeNodes.isEmpty() || !nextActiveNodes.isEmpty()) {
-            long tickStart = System.currentTimeMillis();
-            tick++;
-
-            // 1. 提交上一 Tick 的状态变更（双缓冲交换）
-            Map<String, Object> temp = externalVarsCurrent;
-            externalVarsCurrent = externalVarsNext;
-            externalVarsNext = temp;
-
-            temp = internalVarsCurrent;
-            internalVarsCurrent = internalVarsNext;
-            internalVarsNext = temp;
-            internalVarsNext.clear();
-
-            // 交换激活节点集合
-            Set<String> tempSet = activeNodes;
-            activeNodes = nextActiveNodes;
-            nextActiveNodes = tempSet;
-            nextActiveNodes.clear();
-
-            // 2. 执行当前 Tick 中所有激活的节点
-            for (String nodeId : activeNodes) {
-                Node node = nodeMap.get(nodeId);
-                if (node == null) {
-                    continue;
-                }
-
-                // 更新节点状态为 ACTIVE
-                nodeStates.put(nodeId, "ACTIVE");
-                updateNodeStatus(nodeId, "ACTIVE", "Tick " + tick + " executing " + node.getType());
-
-                // 执行节点逻辑
-                executeNode(node, flowchart, nodeMap, externalVarsCurrent, internalVarsNext, nextActiveNodes, nodeStates);
-
-                // 更新节点状态为 COMPLETED
-                nodeStates.put(nodeId, "COMPLETED");
-                updateNodeStatus(nodeId, "COMPLETED", "Tick " + tick + " finished " + node.getType());
+            void setExtSnapshot(Map<String, Object> snapshot) {
+                if (snapshot == null) throw new IllegalArgumentException("snapshot is null");
+                this.extSnapshot = snapshot;
             }
 
-            // 3. 等待下一个 Tick
+            @Override
+            public long nowMillis() {
+                return System.currentTimeMillis();
+            }
+
+            @Override
+            public Object readExternal(String symbolName) {
+                if (symbolName == null || symbolName.isEmpty()) throw new IllegalArgumentException("symbolName is empty");
+                return extSnapshot.get(symbolName);
+            }
+
+            @Override
+            public int emitAction(String actionId, Map<String, Object> params) {
+                if (actionId == null || actionId.isEmpty()) throw new IllegalArgumentException("actionId is empty");
+                if (params == null) throw new IllegalArgumentException("params is null");
+
+                CapabilityInstance instance = capabilityRegistry.get(actionId);
+                if (instance == null) {
+                    throw new IllegalStateException("Capability not found: " + actionId);
+                }
+                if (handles.containsValue(instance)) {
+                    throw new IllegalStateException("Capability is not re-entrant: " + actionId);
+                }
+
+                long now = nowMillis();
+                instance.start(params, now);
+
+                int handle = nextHandle++;
+                handles.put(handle, instance);
+                return handle;
+            }
+
+            @Override
+            public ActionPoll pollAction(int handle) {
+                CapabilityInstance instance = handles.get(handle);
+                if (instance == null) {
+                    throw new IllegalStateException("Unknown action handle: " + handle);
+                }
+
+                long now = nowMillis();
+                instance.tick(now);
+
+                CapabilityLifecycleState state = instance.getLifecycleState();
+                if (state == CapabilityLifecycleState.RUNNING) {
+                    return new ActionPoll(false, 0);
+                }
+                if (state == CapabilityLifecycleState.DONE) {
+                    handles.remove(handle);
+                    return new ActionPoll(true, 0);
+                }
+                if (state == CapabilityLifecycleState.TIMEOUT) {
+                    handles.remove(handle);
+                    return new ActionPoll(true, 3);
+                }
+                if (state == CapabilityLifecycleState.ERROR) {
+                    CapabilityResult result = instance.getResult();
+                    int cat = 1;
+                    if (result != null && result.getCategory() == CapabilityResultCategory.FATAL_ERROR) {
+                        cat = 2;
+                    }
+                    handles.remove(handle);
+                    return new ActionPoll(true, cat);
+                }
+
+                throw new IllegalStateException("Unsupported lifecycle state: " + state);
+            }
+        }
+
+        EngineHost host = new EngineHost();
+        BytecodeVm vm = new BytecodeVm(program, host, 2000, 0);
+
+        String lastNodeId = null;
+        while (!vm.halted()) {
+            long tickStart = System.currentTimeMillis();
+
+            externalVarsCurrent.clear();
+            externalVarsCurrent.putAll(externalVarsNext);
+
+            Map<String, Object> snapshot = new HashMap<>(externalVarsCurrent);
+            host.setExtSnapshot(snapshot);
+
+            vm.runTick();
+
+            String nodeId = vm.lastNodeId();
+            if (nodeId != null && !nodeId.equals(lastNodeId)) {
+                lastNodeId = nodeId;
+                updateNodeStatus(nodeId, "ACTIVE", "PC entered node");
+            }
+
             long elapsed = System.currentTimeMillis() - tickStart;
             long remaining = tickMillis - elapsed;
             if (remaining > 0) {
@@ -181,147 +217,27 @@ public class TickExecutionEngine {
 
     /**
      * Select the next node based on node type, edge roles, and decision conditions.
-     * This replaces the old findNextNodeId that used findFirst() without considering semantics.
+     * Used for non-branching nodes or as a fallback.
      */
-    private String selectNextNodeId(Node currentNode, Flowchart flowchart, Map<String, Object> externalSnapshot) {
+    private String selectNextNodeId(Node currentNode, Flowchart flowchart, Map<String, Object> externalSnapshot, Map<String, Object> internalSnapshot, Map<String, String> nodeStates) {
         String currentNodeId = currentNode.getId();
         List<Edge> outgoingEdges = flowchart.getEdges().stream()
                 .filter(e -> e.getSource().equals(currentNodeId))
                 .collect(Collectors.toList());
 
-        // No outgoing edges - execution ends
-        if (outgoingEdges.isEmpty()) {
-            return null;
-        }
+        if (outgoingEdges.isEmpty()) return null;
 
-        // Single outgoing edge - default behavior (backward compatibility)
+        // 只有一个出边，直接走
         if (outgoingEdges.size() == 1) {
             return outgoingEdges.get(0).getTarget();
         }
 
-        // Multiple outgoing edges - must use role-based or condition-based selection
-        String nodeType = currentNode.getType();
-        if (nodeType == null) {
-            updateNodeStatus(currentNodeId, "ERROR", "Node type is null, cannot determine next node");
-            return null;
-        }
-
-        String type = nodeType.toLowerCase(Locale.ROOT);
-
-        if ("decision".equals(type)) {
-            return selectDecisionNextNode(currentNode, outgoingEdges, externalSnapshot);
-        } else if ("task".equals(type)) {
-            return selectTaskNextNode(currentNode, outgoingEdges);
-        } else if ("join".equals(type)) {
-            return selectJoinNextNode(currentNode, outgoingEdges);
-        } else {
-            // For other node types, require explicit role on all edges
-            return selectDefaultNextNode(currentNodeId, outgoingEdges);
-        }
-    }
-
-    /**
-     * Select next node for Decision node based on condition evaluation.
-     */
-    private String selectDecisionNextNode(Node decisionNode, List<Edge> outgoingEdges, Map<String, Object> externalSnapshot) {
-        try {
-            boolean conditionResult = evalDecisionCondition(decisionNode, externalSnapshot);
-            String targetRole = conditionResult ? "true" : "false";
-
-            // Find edge with matching role
-            for (Edge edge : outgoingEdges) {
-                Map<String, Object> data = edge.getData();
-                if (data != null && targetRole.equals(data.get("role"))) {
-                    return edge.getTarget();
-                }
-            }
-
-            // No matching edge found - error
-            updateNodeStatus(decisionNode.getId(), "ERROR",
-                    "Decision result is " + conditionResult + " but no outgoing edge with role='" + targetRole + "' found");
-            return null;
-        } catch (Exception e) {
-            updateNodeStatus(decisionNode.getId(), "ERROR",
-                    "Failed to evaluate decision condition: " + e.getMessage());
-            return null;
-        }
-    }
-
-    /**
-     * Select next node for Task node based on outcome role (onDone/onError/onTimeout).
-     */
-    private String selectTaskNextNode(Node taskNode, List<Edge> outgoingEdges) {
-        // For now, default to onDone
-        // In the future, this could be determined by actual task execution outcome
-        String targetRole = "onDone";
-
-        // Check if there's a simulated outcome in node data
-        Map<String, Object> nodeData = taskNode.getData();
-        if (nodeData != null && nodeData.containsKey("simulatedOutcome")) {
-            String outcome = (String) nodeData.get("simulatedOutcome");
-            if ("onError".equals(outcome) || "onTimeout".equals(outcome)) {
-                targetRole = outcome;
-            }
-        }
-
-        // Find edge with matching role
-        for (Edge edge : outgoingEdges) {
-            Map<String, Object> data = edge.getData();
-            if (data != null && targetRole.equals(data.get("role"))) {
-                return edge.getTarget();
-            }
-        }
-
-        // No matching edge found - error
-        updateNodeStatus(taskNode.getId(), "ERROR",
-                "Task outcome is " + targetRole + " but no outgoing edge with role='" + targetRole + "' found");
+        // 多个出边但没明确类型处理，报错或选第一个（Linus 风格：要么明确，要么报错）
+        updateNodeStatus(currentNodeId, "ERROR", "Multiple outgoing edges on non-branching node");
         return null;
     }
 
-    /**
-     * Select next node for Join node based on onReady role.
-     */
-    private String selectJoinNextNode(Node joinNode, List<Edge> outgoingEdges) {
-        String targetRole = "onReady";
-
-        // Find edge with matching role
-        for (Edge edge : outgoingEdges) {
-            Map<String, Object> data = edge.getData();
-            if (data != null && targetRole.equals(data.get("role"))) {
-                return edge.getTarget();
-            }
-        }
-
-        // No matching edge found - error
-        updateNodeStatus(joinNode.getId(), "ERROR",
-                "Join node requires an outgoing edge with role='" + targetRole + "'");
-        return null;
-    }
-
-    /**
-     * Select next node for default node types (start, end, action) based on role.
-     */
-    private String selectDefaultNextNode(String nodeId, List<Edge> outgoingEdges) {
-        // Check if all edges have roles
-        boolean allHaveRoles = true;
-        for (Edge edge : outgoingEdges) {
-            Map<String, Object> data = edge.getData();
-            if (data == null || !data.containsKey("role")) {
-                allHaveRoles = false;
-                break;
-            }
-        }
-
-        if (!allHaveRoles) {
-            updateNodeStatus(nodeId, "ERROR",
-                    "Multiple outgoing edges but not all have roles defined");
-            return null;
-        }
-
-        // For now, select the first edge with a role
-        // In the future, this could be enhanced with more sophisticated selection logic
-        return outgoingEdges.get(0).getTarget();
-    }
+    // --- 移除冗余的 selectDecisionNextNode, selectTaskNextNode, selectJoinNextNode, selectDefaultNextNode ---
 
     /**
      * Evaluate decision condition based on external snapshot.
@@ -330,7 +246,7 @@ public class TickExecutionEngine {
      * - op = EQ/NEQ
      * - right.literal (any value)
      */
-    private boolean evalDecisionCondition(Node decisionNode, Map<String, Object> externalSnapshot) {
+    private boolean evalDecisionCondition(Node decisionNode, Map<String, Object> externalSnapshot, Map<String, Object> internalSnapshot, Map<String, String> nodeStates) {
         Map<String, Object> nodeData = decisionNode.getData();
         if (nodeData == null) {
             throw new RuntimeException("Decision node has no data");
@@ -358,12 +274,8 @@ public class TickExecutionEngine {
         String source = (String) left.get("source");
         String name = (String) left.get("name");
 
-        if (!"external".equals(source)) {
-            throw new RuntimeException("Only external variable source is supported, got: " + source);
-        }
-
         if (name == null || name.isEmpty()) {
-            throw new RuntimeException("External variable name is empty");
+            throw new RuntimeException("Variable name is empty");
         }
 
         // Parse operator
@@ -384,114 +296,127 @@ public class TickExecutionEngine {
             throw new RuntimeException("Right side literal is null");
         }
 
-        // Get external variable value
-        Object varValue = externalSnapshot.get(name);
-        if (varValue == null) {
-            throw new RuntimeException("External variable '" + name + "' not found in snapshot");
+        // Get variable value based on source
+        Object varValue;
+        if ("external".equals(source)) {
+            varValue = externalSnapshot.get(name);
+        } else if ("internal".equals(source)) {
+            varValue = internalSnapshot.get(name);
+        } else if ("taskResult".equals(source)) {
+            varValue = nodeStates.get(name); // Basic support for task results
+        } else {
+            throw new RuntimeException("Unsupported variable source: " + source);
         }
+
+        // If variable is missing, default to null handling or string "null"
+        String varStr = varValue != null ? varValue.toString() : "null";
+        String litStr = literal.toString();
 
         // Compare values
         boolean result;
         if ("EQ".equals(op)) {
-            result = Objects.equals(varValue, literal);
+            result = Objects.equals(varStr, litStr);
         } else { // NEQ
-            result = !Objects.equals(varValue, literal);
+            result = !Objects.equals(varStr, litStr);
         }
 
         return result;
     }
 
     /**
-     * 执行单个节点 - 简单直接，不搞过度抽象
+     * 执行单个节点 - 状态流转权完全交给 executeNode
      */
     private void executeNode(Node node, Flowchart flowchart, Map<String, Node> nodeMap, 
-                           Map<String, Object> externalVarsCurrent, Map<String, Object> internalVarsNext,
-                           Set<String> nextActiveNodes, Map<String, String> nodeStates) {
+                           Map<String, Object> externalVarsCurrent, Map<String, Object> internalVarsCurrent, Map<String, Object> internalVarsNext,
+                           Set<String> nextActiveNodes, Map<String, String> nodeStatesCurrent, Map<String, String> nodeStatesNext) {
         String type = node.getType();
-        if (type == null) {
-            return;
-        }
+        String nodeId = node.getId();
+        if (type == null) return;
 
         String t = type.toLowerCase(Locale.ROOT);
+        String currentState = nodeStatesCurrent.getOrDefault(nodeId, "INACTIVE");
 
-        if ("action".equals(t)) {
-            // Action 节点立即完成，激活下一个节点
-            String nextNodeId = selectNextNodeId(node, flowchart, externalVarsCurrent);
-            if (nextNodeId != null) {
-                nextActiveNodes.add(nextNodeId);
-            }
-        } else if ("task".equals(t)) {
-            // Task 节点：检查是否在等待状态
-            if ("WAITING".equals(nodeStates.get(node.getId()))) {
-                // 检查任务是否完成
-                String taskState = getTaskState(node);
+        // 更新当前执行状态到 WebSocket (可选，用于 UI 展示)
+        updateNodeStatus(nodeId, "ACTIVE", "Executing " + t);
 
-                if ("Done".equals(taskState)) {
-                    nodeStates.put(node.getId(), "COMPLETED");
-                    String nextNodeId = selectNextNodeIdByRole(node, flowchart, "onDone");
-                    if (nextNodeId != null) {
-                        nextActiveNodes.add(nextNodeId);
-                    }
-                } else if ("Error".equals(taskState)) {
-                    nodeStates.put(node.getId(), "ERROR");
-                    String nextNodeId = selectNextNodeIdByRole(node, flowchart, "onError");
-                    if (nextNodeId != null) {
-                        nextActiveNodes.add(nextNodeId);
-                    }
-                } else if ("Timeout".equals(taskState)) {
-                    nodeStates.put(node.getId(), "ERROR");
-                    String nextNodeId = selectNextNodeIdByRole(node, flowchart, "onTimeout");
-                    if (nextNodeId != null) {
-                        nextActiveNodes.add(nextNodeId);
-                    }
+        if ("task".equals(t)) {
+            if ("WAITING".equals(currentState)) {
+                CapabilityInstance instance = runningCapabilities.get(nodeId);
+                if (instance == null) {
+                    nodeStatesNext.put(nodeId, "COMPLETED");
+                    String nextId = selectNextNodeIdByRole(node, flowchart, "onSuccess");
+                    if (nextId != null) nextActiveNodes.add(nextId);
+                    return;
                 }
-                // 仍在 Running，继续等待
+
+                CapabilityLifecycleState state = instance.getLifecycleState();
+                if (state == CapabilityLifecycleState.RUNNING) {
+                    instance.tick(System.currentTimeMillis());
+                    nodeStatesNext.put(nodeId, "WAITING");
+                    nextActiveNodes.add(nodeId);
+                } else {
+                    // 任务结束，根据结果类别选择分支
+                    String role = "onSuccess";
+                    if (state == CapabilityLifecycleState.TIMEOUT) {
+                        role = "onTimeout";
+                    } else if (state == CapabilityLifecycleState.ERROR) {
+                        CapabilityResult result = instance.getResult();
+                        if (result != null && result.getCategory() == CapabilityResultCategory.FATAL_ERROR) {
+                            role = "onAbort";
+                        } else {
+                            role = "onRetry";
+                        }
+                    }
+
+                    nodeStatesNext.put(nodeId, state == CapabilityLifecycleState.DONE ? "COMPLETED" : "ERROR");
+                    String nextId = selectNextNodeIdByRole(node, flowchart, role);
+                    if (nextId != null) nextActiveNodes.add(nextId);
+                    updateNodeStatus(nodeId, nodeStatesNext.get(nodeId), "Task finished with " + role);
+                    runningCapabilities.remove(nodeId);
+                }
             } else {
-                // 首次激活 Task，启动能力并进入等待状态
+                // 首次进入：启动异步能力
                 startCapability(node);
-                nodeStates.put(node.getId(), "WAITING");
-                nextActiveNodes.add(node.getId()); // 下一 tick 继续检查
+                nodeStatesNext.put(nodeId, "WAITING");
+                nextActiveNodes.add(nodeId); // 下个 tick 开始轮询
+                updateNodeStatus(nodeId, "WAITING", "Task started, waiting for capability...");
             }
         } else if ("decision".equals(t)) {
-            // Decision 节点：立即评估条件并选择分支
+            // Decision 是瞬时节点
             try {
-                boolean conditionResult = evalDecisionCondition(node, externalVarsCurrent);
-                String targetRole = conditionResult ? "true" : "false";
-                String nextNodeId = selectNextNodeIdByRole(node, flowchart, targetRole);
-                if (nextNodeId != null) {
-                    nextActiveNodes.add(nextNodeId);
+                boolean result = evalDecisionCondition(node, externalVarsCurrent, internalVarsCurrent, nodeStatesCurrent);
+                String role = result ? "true" : "false";
+                nodeStatesNext.put(nodeId, "COMPLETED");
+                String nextId = selectNextNodeIdByRole(node, flowchart, role);
+                if (nextId != null) {
+                    nextActiveNodes.add(nextId);
                 } else {
-                    nodeStates.put(node.getId(), "ERROR");
-                    updateNodeStatus(node.getId(), "ERROR", 
-                            "Decision result is " + conditionResult + " but no outgoing edge with role='" + targetRole + "' found");
+                    nodeStatesNext.put(nodeId, "ERROR");
+                    updateNodeStatus(nodeId, "ERROR", "No edge for role: " + role);
                 }
             } catch (Exception e) {
-                nodeStates.put(node.getId(), "ERROR");
-                updateNodeStatus(node.getId(), "ERROR", 
-                        "Failed to evaluate decision condition: " + e.getMessage());
+                nodeStatesNext.put(nodeId, "ERROR");
+                updateNodeStatus(nodeId, "ERROR", "Eval failed: " + e.getMessage());
             }
         } else if ("join".equals(t)) {
-            // Join 节点：检查是否满足汇合条件
-            if (checkJoinCondition(node, nodeStates)) {
-                String nextNodeId = selectNextNodeIdByRole(node, flowchart, "onReady");
-                if (nextNodeId != null) {
-                    nextActiveNodes.add(nextNodeId);
-                } else {
-                    nodeStates.put(node.getId(), "ERROR");
-                    updateNodeStatus(node.getId(), "ERROR", 
-                            "Join node requires an outgoing edge with role='onReady'");
-                }
+            // Join 可能是跨 Tick 的
+            if (checkJoinCondition(node, nodeStatesCurrent)) {
+                nodeStatesNext.put(nodeId, "COMPLETED");
+                String nextId = selectNextNodeIdByRole(node, flowchart, "onReady");
+                if (nextId != null) nextActiveNodes.add(nextId);
             } else {
-                // 不满足条件，继续等待
-                nodeStates.put(node.getId(), "WAITING");
-                nextActiveNodes.add(node.getId());
+                // 还没凑齐，下个 tick 继续蹲守
+                nodeStatesNext.put(nodeId, "WAITING");
+                nextActiveNodes.add(nodeId);
             }
-        } else {
-            // 其他节点类型：简单处理，激活下一个节点
-            String nextNodeId = selectNextNodeId(node, flowchart, externalVarsCurrent);
-            if (nextNodeId != null) {
-                nextActiveNodes.add(nextNodeId);
-            }
+        } else if ("start".equals(t) || "input".equals(t) || "action".equals(t) || "default".equals(t)) {
+            // 瞬时完成节点
+            nodeStatesNext.put(nodeId, "COMPLETED");
+            String nextId = selectNextNodeId(node, flowchart, externalVarsCurrent, internalVarsCurrent, nodeStatesCurrent);
+            if (nextId != null) nextActiveNodes.add(nextId);
+        } else if ("end".equals(t) || "output".equals(t)) {
+            nodeStatesNext.put(nodeId, "COMPLETED");
+            updateNodeStatus(nodeId, "COMPLETED", "Flow finished at end node");
         }
     }
 
@@ -509,38 +434,33 @@ public class TickExecutionEngine {
                 return edge.getTarget();
             }
         }
-
         return null;
-    }
-
-    /**
-     * 获取任务状态 - 简单实现，后续可接入真实能力
-     */
-    private String getTaskState(Node taskNode) {
-        // 简单实现：从节点数据中读取模拟状态
-        Map<String, Object> nodeData = taskNode.getData();
-        if (nodeData != null && nodeData.containsKey("simulatedState")) {
-            return (String) nodeData.get("simulatedState");
-        }
-        // 默认返回 Done
-        return "Done";
     }
 
     /**
      * 启动能力 - 简单实现，后续可接入真实能力
      */
     private void startCapability(Node taskNode) {
-        // 简单实现：设置模拟状态为 Running
         Map<String, Object> nodeData = taskNode.getData();
         if (nodeData == null) {
-            nodeData = new HashMap<>();
-            taskNode.setData(nodeData);
+            throw new RuntimeException("Task node has no data");
         }
-        nodeData.put("simulatedState", "Running");
-
-        // 简单实现：模拟能力在 3 个 tick 后完成
-        // 实际实现中，这里应该调用 Host 接口启动能力
-        // Host 会在后续 tick 中更新能力状态
+        
+        String capabilityId = (String) nodeData.get("capabilityId");
+        if (capabilityId == null || capabilityId.isEmpty()) {
+            throw new RuntimeException("Task node missing capabilityId");
+        }
+        
+        CapabilityInstance instance = capabilityRegistry.get(capabilityId);
+        if (instance == null) {
+            throw new RuntimeException("Capability not found: " + capabilityId);
+        }
+        
+        @SuppressWarnings("unchecked")
+        Map<String, Object> params = (Map<String, Object>) nodeData.get("capabilityParams");
+        instance.start(params != null ? params : new HashMap<>(), System.currentTimeMillis());
+        
+        runningCapabilities.put(taskNode.getId(), instance);
     }
 
     /**

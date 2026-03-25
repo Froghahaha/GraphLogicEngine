@@ -81,3 +81,24 @@ export interface DecisionCondition {
     op: ComparisonOp;
     right: VariableRef | { literal: any };
 }
+
+export interface InputParamDef {
+    name: string;
+    type: string;
+    required: boolean;
+    defaultValue?: string;
+    description: string;
+}
+
+export interface ResultCodeDef {
+    code: string;
+    category: string;
+    description: string;
+}
+
+export interface CapabilityMetadata {
+    id: string;
+    version: string;
+    description: string;
+    recommendedTimeoutMs: number;
+}

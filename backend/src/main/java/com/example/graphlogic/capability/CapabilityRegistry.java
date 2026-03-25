@@ -20,5 +20,9 @@ public class CapabilityRegistry {
         }
         return instances.get(id);
     }
+
+    public java.util.Collection<CapabilityInstance> getAll() {
+        return instances.values();
+    }
 }
 

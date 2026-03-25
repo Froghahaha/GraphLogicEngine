@@ -5,12 +5,6 @@ export type DecisionConditionType =
     | 'LAST_TASK_RESULT_CODE'
     | 'EXTERNAL_VAR_BOOL';
 
-export const capabilityOptions = [
-    { id: 'MoveToPose', label: 'MoveToPose' },
-    { id: 'PickObject', label: 'PickObject' },
-    { id: 'ScanQRCode', label: 'ScanQRCode' },
-];
-
 export const decisionConditionTypes: { id: DecisionConditionType; label: string }[] = [
     { id: 'LAST_TASK_CATEGORY', label: 'Last Task Category' },
     { id: 'LAST_TASK_RESULT_CODE', label: 'Last Task Result Code' },
@@ -25,7 +19,7 @@ export const decisionCategoryOptions = [
 
 export function getAllowedEdgeRoles(sourceNodeKind: NodeKind | undefined): string[] {
     if (sourceNodeKind === 'task') {
-        return ['onDone', 'onError', 'onTimeout'];
+        return ['onSuccess', 'onRetry', 'onAbort', 'onTimeout'];
     }
     if (sourceNodeKind === 'decision') {
         return ['true', 'false'];

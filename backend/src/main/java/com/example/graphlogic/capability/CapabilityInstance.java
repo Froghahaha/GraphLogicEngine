@@ -8,6 +8,8 @@ public interface CapabilityInstance {
 
     String version();
 
+    CapabilityMetadata getMetadata();
+
     CapabilityLifecycleState getLifecycleState();
 
     CapabilityResult getResult();

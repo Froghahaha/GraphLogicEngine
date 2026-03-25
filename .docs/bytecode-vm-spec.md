@@ -99,6 +99,10 @@ sequenceDiagram
 
 所有多字节字段采用 **Little Endian**。
 
+### 对齐规则 (Alignment)
+- Header、Section Table 以及所有 Section 的 `offset` 必须 **4-byte aligned**。
+- 若需要填充，使用 `0x00` 作为 padding。
+
 ### 5.1 Header (64 bytes)
 | Offset | Field | Type | Description |
 | :--- | :--- | :--- | :--- |
@@ -127,6 +131,10 @@ sequenceDiagram
 | flags | u8 | 0x01=EXTERNAL, 0x02=READONLY |
 | type | u8 | 1=BOOL, 2=I32, 3=F32, 4=STR_REF |
 | binding | u32 | EXTERNAL: Host Binding ID / Register Addr<br>INTERNAL: Offset in Internal State Buffer |
+
+#### 5.3.1 Load-time Relocation (加载期重定位)
+- VM Loader 必须将 Symbol Table 转换为运行时可直接索引的结构（例如 `id -> binding/offset`）。
+- VM 执行期不得进行昂贵的符号查找；对 Internal State 的访问应当是“按 offset 直接寻址”。
 
 ### 5.4 Bytecode (Type=3)
 紧凑指令流。
@@ -166,9 +174,10 @@ sequenceDiagram
 | Opcode | Mnemonic | Operands | Description |
 | :--- | :--- | :--- | :--- |
 | 0x50 | CALL_ACTION | id:u16, argc:u8 | Pop args, Emit Command, Push ActionHandle |
-| 0x51 | WAIT_ACTION | - | Pop ActionHandle, Wait for DONE/ERROR |
+| 0x51 | WAIT_ACTION | - | Pop ActionHandle. If not finished, block Frame. If finished, push Category(u8): 0=SUCCESS, 1=RETRY, 2=ABORT, 3=TIMEOUT |
 | 0x52 | WAIT_EXT | id:u16, cond:u8 | Wait for External Symbol satisfy condition |
 | 0x53 | SPAWN | target:u16 | Create new Frame at target PC |
+| 0x54 | WAIT_JOIN | mode:u8, n:u8 | Pop n ActionHandles, wait by mode. If ready, push bool |
 
 ## 7. Host Binding 接口 (Host Interface)
 
@@ -199,6 +208,8 @@ bool host_load_internal(void* buffer, size_t size);
 - **Type Safety**: 静态类型检查，禁止隐式转换。
 - **Cycle Safety**: 所有循环结构必须包含 `YIELD` 或显式的 `WAIT`，或由编译器插入 MaxIterations 计数器，防止单 Tick 死循环。
 
+同时，VM 运行时必须具备硬性预算控制（例如每 Tick 最大指令步数 `max_steps_per_tick`）。预算耗尽时，等价于执行一次 `YIELD` 并在下一 Tick 继续。
+
 ### 8.2 变量生灭 (Variable Lifecycle)
 - **Definition**: 扫描全图所有的 `STORE_INT` 指令，收集所有 Internal Symbols。
 - **Initialization**: 对于所有 Internal Symbols，在 Program Start 处插入初始化指令 (默认 0/false)。
@@ -210,7 +221,7 @@ High-level Action Node: `MoveTo(p1, p2)` 编译为:
 PUSH_CONST p1
 PUSH_CONST p2
 CALL_ACTION ID_MOVE_TO, 2  ; Stack: [handle]
-WAIT_ACTION                ; Stack: [] (Blocks until Host reports DONE)
+WAIT_ACTION                ; Stack: [category:u8] (Blocks until finished)
 ```
 
 ### 8.4 状态机与算法实现

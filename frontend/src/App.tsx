@@ -10,7 +10,7 @@ import {
 import FlowEditor from './FlowEditor';
 import { Client } from '@stomp/stompjs';
 import axios from 'axios';
-import type { ExternalVarDef, LogicalInternalVarDef, NodeStatus } from './types';
+import type { ExternalVarDef, LogicalInternalVarDef, NodeStatus, CapabilityMetadata } from './types';
 import NodeInspector from './NodeInspector';
 import EdgeInspector from './EdgeInspector';
 import VariablePanel from './VariablePanel';
@@ -51,6 +51,7 @@ function App() {
     const [selectedEdgeId, setSelectedEdgeId] = useState<string | null>(null);
     const [externalVars, setExternalVars] = useState<ExternalVarDef[]>([]);
     const [internalVars, setInternalVars] = useState<LogicalInternalVarDef[]>([]);
+    const [capabilities, setCapabilities] = useState<CapabilityMetadata[]>([]);
 
     const pushLog = useCallback((event: Omit<LogEvent, 'time'>) => {
         setLogs(prev => [...prev, { ...event, time: Date.now() }]);
@@ -128,6 +129,19 @@ function App() {
                     source: 'backend',
                     action: 'schema.externalVars.error',
                     message: 'Failed to load external vars',
+                    payload: { error: String(err) },
+                }),
+            );
+
+        axios
+            .get<CapabilityMetadata[]>('http://localhost:8080/api/schema/capabilities')
+            .then(res => setCapabilities(res.data))
+            .catch(err =>
+                pushLog({
+                    level: 'error',
+                    source: 'backend',
+                    action: 'schema.capabilities.error',
+                    message: 'Failed to load capabilities',
                     payload: { error: String(err) },
                 }),
             );
@@ -368,12 +382,14 @@ function App() {
                 <div style={{ flex: 1, borderLeft: '1px solid #ccc', padding: '10px', overflowY: 'auto', background: '#fafafa', display: 'flex', flexDirection: 'column', gap: '12px' }}>
                     <NodeInspector
                         node={selectedNode}
+                        allNodes={nodes}
                         allTaskNodes={allTaskNodes}
                         edges={edges}
                         selectedEdgeId={selectedEdgeId}
                         onSelectEdge={setSelectedEdgeId}
                         externalVars={externalVars}
                         internalVars={internalVars}
+                        capabilities={capabilities}
                         onChange={handleNodeDataChange}
                     />
                     <EdgeInspector
